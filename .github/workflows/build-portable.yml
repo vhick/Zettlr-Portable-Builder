@@ -1,0 +1,131 @@
+name: Build Zettlr Portable (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable upstream release: latest or v4.8.0'
+        required: true
+        default: 'latest'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 Portable ZIP
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out portable builder
+        uses: actions/checkout@v5
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install original icon extraction dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check --no-cache-dir pefile==2024.8.26 Pillow==11.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Icon dependency installation failed.' }
+
+      - name: Run offline builder regression tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Builder tests failed.' }
+
+      - name: Download official stable Zettlr Windows installer
+        shell: pwsh
+        env:
+          UPSTREAM_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python scripts/download_official.py --version "$env:UPSTREAM_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream release download/checksum failed.' }
+
+      - name: Verify Windows installer signature before extraction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path -LiteralPath 'work/download/ZettlrSetup.exe').Path
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          Write-Host "Signature status: $($signature.Status)"
+          if ($signature.SignerCertificate) { Write-Host "Signer: $($signature.SignerCertificate.Subject)" }
+          if ($signature.Status -ne 'Valid') { throw 'Upstream installer Authenticode signature is invalid or absent. Refusing to package.' }
+
+      - name: Extract official installer without running it
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sevenZip = (Get-Command '7z.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+          if (-not $sevenZip) { $sevenZip = 'C:\Program Files\7-Zip\7z.exe' }
+          if (-not (Test-Path -LiteralPath $sevenZip)) { throw '7-Zip not found on Windows runner.' }
+          New-Item -ItemType Directory -Force -Path 'work/extracted' | Out-Null
+          & $sevenZip 'x' '-y' '-owork/extracted' 'work/download/ZettlrSetup.exe'
+          if ($LASTEXITCODE -ne 0) { throw '7-Zip extraction of official installer failed.' }
+          python scripts/locate_zettlr.py "$sevenZip"
+          if ($LASTEXITCODE -ne 0) { throw 'Expected complete Electron app payload not found (Zettlr.exe + resources/app.asar).' }
+
+      - name: Extract original multi-resolution Zettlr icon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = (Get-Content -LiteralPath 'work/source_path.txt' -Raw).Trim()
+          python scripts/extract_icon.py "$binary" 'work/appicon.ico'
+          if ($LASTEXITCODE -ne 0) { throw 'Original icon not found in Zettlr executable.' }
+          python scripts/icon_pngs.py 'work/appicon.ico' 'work/icons'
+          if ($LASTEXITCODE -ne 0) { throw 'Original icon could not be converted to PortableApps menu sizes.' }
+
+      - name: Compile launcher and test file and registry TraceGuard
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
+          if (-not (Test-Path -LiteralPath $csc)) { throw '.NET Framework C# compiler missing on Windows runner.' }
+          $sources = @(
+            (Resolve-Path -LiteralPath 'launcher/ZettlrPortable.cs').Path,
+            (Resolve-Path -LiteralPath 'launcher/TraceGuard.cs').Path,
+            (Resolve-Path -LiteralPath 'launcher/RegistryTraceGuard.cs').Path
+          )
+          $icon = (Resolve-Path -LiteralPath 'work/appicon.ico').Path
+          $target = Join-Path (Resolve-Path -LiteralPath 'work').Path 'ZettlrPortable.exe'
+          & $csc '/nologo' '/target:winexe' '/platform:x64' '/optimize+' "/out:$target" "/win32icon:$icon" '/reference:System.Windows.Forms.dll' $sources
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target)) { throw 'Windows launcher compilation failed.' }
+          foreach ($argument in @('--portable-self-test', '--traceguard-self-test', '--registrytrace-self-test')) {
+            $process = Start-Process -FilePath $target -ArgumentList $argument -PassThru -ErrorAction Stop
+            try {
+              if (-not $process.WaitForExit(15000)) {
+                try { $process.Kill() } catch { }
+                throw "Self-test $argument timed out after 15 seconds."
+              }
+              if ($process.ExitCode -ne 0) { throw "Self-test $argument failed with code $($process.ExitCode)." }
+            }
+            finally { $process.Dispose() }
+          }
+          if (Test-Path -LiteralPath 'work/Data') { throw 'Launcher self-test unexpectedly created actual application data.' }
+          Write-Host 'PASS: 3 headless Windows launcher/TraceGuard tests.'
+
+      - name: Create and verify single portable application ZIP
+        shell: pwsh
+        run: |
+          python scripts/package_app.py
+          if ($LASTEXITCODE -ne 0) { throw 'Application ZIP packaging failed.' }
+          python scripts/verify_package.py
+          if ($LASTEXITCODE -ne 0) { throw 'Final portable ZIP verification failed.' }
+
+      - name: Upload ZIP-only portable artifact (1-day retention)
+        uses: actions/upload-artifact@v6
+        with:
+          name: Zettlr-Portable-Windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
